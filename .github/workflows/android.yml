@@ -43,7 +43,16 @@ jobs:
         env:
           KEYSTORE: ${{ secrets.ANDROID_DEBUG_KEYSTORE }}
         run: |
-          if [ -n "$KEYSTORE" ]; then mkdir -p ~/.android && echo "$KEYSTORE" | base64 -d > ~/.android/debug.keystore; echo "usando chave fixa"; else echo "sem chave fixa"; fi
+          if [ -z "$KEYSTORE" ]; then echo "sem chave fixa"; exit 0; fi
+          mkdir -p ~/.android
+          echo "$KEYSTORE" | base64 -d > ~/.android/debug.keystore
+          # chave inválida não pode quebrar o build: volta para a chave aleatória
+          if keytool -list -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey > /dev/null; then
+            echo "usando chave fixa"
+          else
+            echo "::warning::chave fixa inválida, usando chave aleatória"
+            rm ~/.android/debug.keystore
+          fi
 
       - name: Compilar APK
         working-directory: app/android
