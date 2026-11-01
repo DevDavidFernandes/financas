@@ -293,13 +293,24 @@ details.more[open] summary { margin-bottom: 12px; }
 // ou pré-visualização local com dados de exemplo.
 const API_URL = 'https://script.google.com/macros/s/AKfycbz3Co8V8b3EVwtCHa3aMYF1LjFB_R9FrATPG4CdWmatZOLWApeCw8XNLnzIMLt_FVvl/exec';
 const IN_GAS = typeof google !== 'undefined' && !!google.script;
-const IS_LOCAL = /^(localhost|127\.0\.0\.1|)$/.test(location.hostname) && !/[?&]api\b/.test(location.search);
+const IS_APP = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+const IS_LOCAL = !IS_APP && /^(localhost|127\.0\.0\.1|)$/.test(location.hostname) && !/[?&]api\b/.test(location.search);
+// Parte nativa do app Android (leitura de notificações e botões "De quem foi?")
+const Nativo = IS_APP && window.Capacitor.Plugins ? window.Capacitor.Plugins.Financas : null;
+function nativo(metodo, dados) {
+  if (!Nativo || !Nativo[metodo]) return Promise.resolve(null);
+  return Nativo[metodo](dados || {}).catch(() => null);
+}
 const USE_API = !IN_GAS && !IS_LOCAL;
 const NO_GOOGLE = !IN_GAS && !USE_API;
 const SESS_KEY = 'fin_sessao';
 const OPEN_API = ['api_estado', 'api_criarSenha', 'api_entrar'];
 let SESSAO = (() => { try { return localStorage.getItem(SESS_KEY) || ''; } catch (e) { return ''; } })();
-function saveSession(s) { SESSAO = s || ''; try { s ? localStorage.setItem(SESS_KEY, s) : localStorage.removeItem(SESS_KEY); } catch (e) { /* fica só nesta aba */ } }
+function saveSession(s) {
+  SESSAO = s || '';
+  try { s ? localStorage.setItem(SESS_KEY, s) : localStorage.removeItem(SESS_KEY); } catch (e) { /* fica só nesta aba */ }
+  nativo('configurar', { sessao: SESSAO, url: API_URL });
+}
 function call(fn, ...args) {
   if (NO_GOOGLE) return Promise.resolve(Mock[fn](...args));
   const full = OPEN_API.includes(fn) ? args : [SESSAO, ...args];
@@ -333,6 +344,11 @@ function load(json) {
   DB.lancamentos.forEach(t => { t._d = new Date(t['Data']); t['Valor'] = Number(t['Valor']) || 0; t['Parte terceiro'] = Number(t['Parte terceiro']) || 0; });
   DB.lancamentos.sort((a, b) => b._d - a._d);
   render();
+  if (IS_APP) {
+    nativo('configurar', { pessoa: people()[0] || '', url: API_URL, sessao: SESSAO }).then(st => {
+      if (st && (!st.token || !st.leitura) && !load.avisou) { load.avisou = true; toast('Termine de configurar o app na aba Contas.'); }
+    });
+  }
 }
 
 // ───────── cálculos (sempre em centavos; as funções puras são testadas em testes.js) ─────────
@@ -472,6 +488,7 @@ function render() {
     planejamento: renderPlanejamento, relatorios: renderRelatorios, calendario: renderCalendario };
   document.getElementById('app').innerHTML = navHTML() + `<div class="screen">${telas[aba]()}</div>`;
   bindApp();
+  if (IS_APP && aba === 'contas') preencherAppCard();
 }
 
 function renderResumo() {
@@ -1030,7 +1047,32 @@ function renderContas() {
     </div>`).join('')}</div>
     ${inativas.length ? `<p class="hint">Inativas: ${inativas.map(c => `<button class="link" data-acc="${esc(c['Nome'])}">${esc(c['Nome'])}</button>`).join(', ')}</p>` : ''}
     <div class="row-actions"><button class="btn" data-newacc="1">Nova conta</button><button class="btn primary" data-transfer="1">Transferir entre contas</button></div>
-  </section>`;
+  </section>${IS_APP ? '<section class="card" id="appCard"><div class="head"><h2>App no celular</h2><small>leitura das notificações</small></div><div class="empty">Conferindo…</div></section>' : ''}`;
+}
+
+/** Preenche o cartão "App no celular": token, permissão de leitura, teste. */
+function preencherAppCard() {
+  const el = document.getElementById('appCard');
+  if (!el) return;
+  nativo('estado').then(st => {
+    if (!st) { el.querySelector('.empty').textContent = 'Parte nativa indisponível nesta versão.'; return; }
+    const item = (ok, txt) => `<div class="fx ${ok ? 'paid' : 'late'}"><span class="dot">${ok ? '✓' : ''}</span><span class="n"><b>${txt}</b></span></div>`;
+    el.innerHTML = `<div class="head"><h2>App no celular</h2><small>substitui o MacroDroid</small></div>
+      <div class="fixed">${item(st.token, 'Token do receptor salvo')}${item(st.leitura, 'Leitura de notificações liberada')}${item(st.avisos, 'Notificação "De quem foi?" permitida')}${item(st.sessao, 'Sessão do painel guardada para os botões')}</div>
+      <label class="field" style="margin-top:10px"><span>Token (aba Config da planilha)</span><input id="apToken" autocomplete="off" placeholder="${st.token ? 'já salvo — cole outro para trocar' : 'cole aqui'}"></label>
+      <div class="row-actions"><button class="btn" id="apSalvar">Salvar token</button><button class="btn" id="apLeitura">Liberar leitura</button><button class="btn primary" id="apTestar">Testar conexão</button></div>
+      <p class="hint">Depois que o teste der certo e uma compra real aparecer em "A revisar", desligue a macro do MacroDroid para não ficar com dois leitores.</p>`;
+    el.querySelector('#apSalvar').onclick = () => {
+      const t = el.querySelector('#apToken').value.trim();
+      if (!t) return toast('Cole o token da aba Config.');
+      nativo('configurar', { token: t, url: API_URL }).then(() => { toast('Token salvo.'); preencherAppCard(); });
+    };
+    el.querySelector('#apLeitura').onclick = () => nativo('abrirPermissaoNotificacoes');
+    el.querySelector('#apTestar').onclick = () => nativo('testar').then(r => {
+      const resp = r && r.resposta || 'sem resposta';
+      toast(resp === 'não reconhecido' ? 'Conexão ok: o receptor respondeu.' : resp === 'negado' ? 'Token errado: confira na aba Config.' : 'Resposta: ' + resp);
+    });
+  });
 }
 
 function renderPlanejamento() {
@@ -1694,6 +1736,8 @@ function showLock(temSenha) {
      .catch(x => { err.textContent = String((x && x.message) || x).replace(/^Error:\s*/, ''); err.hidden = false; btn.disabled = false; });
   };
 }
+
+document.addEventListener('visibilitychange', () => { if (!document.hidden && IS_APP && DB && aba === 'contas') preencherAppCard(); });
 
 function start() {
   document.getElementById('demo').hidden = !NO_GOOGLE;
