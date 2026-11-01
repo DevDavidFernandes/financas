@@ -67,6 +67,16 @@ button { cursor: pointer; }
 .month button { border: 0; background: none; width: 32px; height: 32px; border-radius: 50%; font-size: 18px; color: var(--muted); }
 .month button:hover { background: var(--surface-2); color: var(--fg); }
 .month span { min-width: 112px; text-align: center; font-weight: 600; }
+.top { flex-wrap: wrap; }
+.logout { border: 1px solid var(--line); background: none; color: var(--muted); border-radius: 999px; padding: 6px 12px; font-size: 13px; font-weight: 600; }
+.logout:hover { color: var(--fg); border-color: var(--ashes); }
+details.more { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+details.more summary { cursor: pointer; font-size: 13px; font-weight: 700; color: var(--muted); }
+details.more[open] summary { margin-bottom: 12px; }
+.more-body { display: grid; gap: 12px; }
+.hint { margin: 0; color: var(--muted); font-size: 13px; }
+.confirm { background: var(--surface-2); border-radius: 10px; padding: 10px 12px; display: flex; gap: 8px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+.bill-closed { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; color: var(--warn); background: var(--warn-soft); border-radius: 10px; padding: 8px 10px; }
 
 .demo { background: var(--warn-soft); color: var(--warn); border-radius: 10px; padding: 8px 12px; font-size: 13px; font-weight: 600; margin-bottom: 12px; }
 
@@ -219,6 +229,7 @@ button { cursor: pointer; }
       <span id="monthLabel"></span>
       <button id="next" aria-label="Próximo mês">›</button>
     </div>
+    <button class="logout" id="logout" hidden>Sair</button>
   </header>
   <div id="demo" class="demo" hidden>Modo demonstração: os valores abaixo são exemplos. Instalado no Google, aparecem os seus dados reais.</div>
   <main id="app"><div class="loading">Carregando seus lançamentos…</div></main>
@@ -275,30 +286,80 @@ function load(json) {
   render();
 }
 
-// ───────── cálculos ─────────
+// ───────── cálculos (sempre em centavos; as funções puras são testadas em testes.js) ─────────
+function cents(v) {
+  if (v === null || v === undefined || v === '') return 0;
+  const n = typeof v === 'number' ? v : Number(String(v).replace(',', '.'));
+  return isNaN(n) ? 0 : Math.round(n * 100);
+}
+const moneyC = c => BRL.format((c || 0) / 100);
+
+/** Mesma regra do Code.gs: mês de vencimento ('aaaa-mm') da fatura de uma compra. */
+function calcularFatura(fechamento, vencimento, data) {
+  let ano = data.getFullYear(), mes = data.getMonth();
+  if (data.getDate() >= fechamento) mes += 1;
+  if (vencimento <= fechamento) mes += 1;
+  ano += Math.floor(mes / 12);
+  mes = mes % 12;
+  return ano + '-' + String(mes + 1).padStart(2, '0');
+}
+
+/** Minha parte de um gasto. Pendente, previsto, transferência e pagamento de fatura nunca contam. */
+function contaComoMeuGasto(t) {
+  if (t['Tipo'] !== 'Saída' || t['Status'] === 'A classificar' || t['Status'] === 'Previsto') return 0;
+  return Math.max(0, cents(t['Valor']) - cents(t['Parte terceiro']));
+}
+
+/** Renda: entrada confirmada que não é reembolso (pessoa marcada "não conta como renda"). */
+function contaComoRenda(t, pessoas) {
+  if (t['Tipo'] !== 'Entrada' || t['Status'] === 'A classificar' || t['Status'] === 'Previsto') return 0;
+  const p = (pessoas || []).find(x => x['Nome'] === t['Pessoa']);
+  if (p && /^n[aã]o$/i.test(String(p['Conta como renda']).trim())) return 0;
+  return cents(t['Valor']);
+}
+
+/** Resumo de uma lista já filtrada pelo período, em centavos. */
+function resumoMes(lista, pessoas) {
+  const r = { entradas: 0, gastos: 0, previsto: 0, pendentes: 0, terceiros: 0 };
+  lista.forEach(t => {
+    r.entradas += contaComoRenda(t, pessoas);
+    r.gastos += contaComoMeuGasto(t);
+    if (t['Status'] === 'Previsto') r.previsto += cents(t['Valor']);
+    if (t['Status'] === 'A classificar') r.pendentes += cents(t['Valor']);
+    if (t['Tipo'] === 'Saída' && t['Status'] !== 'A classificar') r.terceiros += cents(t['Parte terceiro']);
+  });
+  return r;
+}
+
+/** Positivo: a pessoa me deve. Negativo: eu devo a ela. Em centavos. */
+function saldoPessoa(lista, nome) {
+  let s = 0;
+  lista.forEach(t => {
+    if (t['Pessoa'] !== nome || t['Status'] === 'A classificar') return;
+    if (t['Tipo'] === 'Saída') s += cents(t['Parte terceiro']);
+    else if (t['Tipo'] === 'Entrada') s -= cents(t['Valor']);
+  });
+  return s;
+}
+
+const CAT_ENTRE_CONTAS = 'Entre contas';
+const CAT_FATURA = 'Pagamento de fatura';
 const people = () => DB.pessoas.filter(p => norm(p['Controla saldo']) === 'SIM').map(p => p['Nome']);
 const isPending = t => t['Status'] === 'Novo' || t['Status'] === 'A classificar';
-const myShare = t => t['Tipo'] === 'Saída' ? t['Valor'] - t['Parte terceiro'] : 0;
-function countsAsIncome(t) {
-  if (t['Tipo'] !== 'Entrada' || t['Status'] === 'A classificar' || t['Status'] === 'Previsto') return false;
-  const p = DB.pessoas.find(x => x['Nome'] === t['Pessoa']);
-  return !(p && norm(p['Conta como renda']) === 'NAO');
-}
+const isCardPayment = t => t['Tipo'] === 'Transferência' && t['Categoria'] === CAT_FATURA;
 function monthTx(key) { return DB.lancamentos.filter(t => ym(t._d) === key); }
+function cardOf(id) { const a = norm(id); return a ? DB.cartoes.find(c => norm(c['Final']) === a || norm(c['Nome']) === a) : null; }
+const cardLabel = id => { const c = cardOf(id); return c ? c['Nome'] : String(id || ''); };
 
 function summary(key) {
-  const tx = monthTx(key);
-  const entradas = tx.filter(countsAsIncome).reduce((s, t) => s + t['Valor'], 0);
-  const gastos = tx.filter(t => t['Tipo'] === 'Saída').reduce((s, t) => s + myShare(t), 0);
-  const salarioPrevisto = tx.filter(t => t['Status'] === 'Previsto').reduce((s, t) => s + t['Valor'], 0);
-  const fx = fixedStatus(key);
-  const fixosPendentes = fx.filter(f => !f.paid).reduce((s, f) => s + f.valor, 0);
-  return { entradas, gastos, saldo: entradas - gastos, salarioPrevisto, fixosPendentes,
-           previsto: entradas + salarioPrevisto - gastos - fixosPendentes };
+  const r = resumoMes(monthTx(key), DB.pessoas);
+  const fixosPendentes = fixedStatus(key).filter(f => !f.paid).reduce((s, f) => s + cents(f.valor), 0);
+  return Object.assign(r, { saldo: r.entradas - r.gastos, fixosPendentes,
+    fimPrevisto: r.entradas + r.previsto - r.gastos - fixosPendentes });
 }
 
 function fixedStatus(key) {
-  const tx = monthTx(key).filter(t => t['Tipo'] === 'Saída');
+  const tx = monthTx(key).filter(t => t['Tipo'] === 'Saída' && t['Status'] !== 'A classificar');
   const today = new Date();
   return DB.fixos.map(f => {
     const kw = String(f['Palavra-chave'] || f['Nome']).split('|').map(norm).filter(Boolean);
@@ -306,49 +367,64 @@ function fixedStatus(key) {
     const dia = Number(f['Dia']) || 1;
     const [y, m] = key.split('-').map(Number);
     const due = new Date(y, m - 1, dia);
-    return { nome: f['Nome'], valor: Number(f['Valor']) || 0, dia, forma: f['Forma'], paid: !!hit, hit,
+    return { nome: f['Nome'], valor: cents(f['Valor']) / 100, dia, forma: f['Forma'], paid: !!hit, hit,
              late: !hit && due < today && ym(today) === key };
   });
 }
 
-function billFor(card, date) {
-  const fech = Number(card['Fechamento']);
-  let d = new Date(date.getFullYear(), date.getMonth(), 1);
-  if (date.getDate() >= fech) d.setMonth(d.getMonth() + 1);
-  return ym(d);
-}
+/** Faturas de cada cartão: atual, fechada a pagar, próxima, limite usado. Tudo em centavos. */
 function bills() {
   const today = new Date();
   return DB.cartoes.map(c => {
-    const open = billFor(c, today);
-    const tx = DB.lancamentos.filter(t => String(t['Cartão']) === String(c['Final']) && t['Tipo'] === 'Saída');
-    const sum = k => tx.filter(t => t['Fatura'] === k).reduce((s, t) => s + t['Valor'], 0);
-    const [y, m] = open.split('-').map(Number);
-    const closes = new Date(y, m - 1, Number(c['Fechamento']));
-    const due = new Date(y, m - 1, Number(c['Vencimento']));
-    const used = tx.filter(t => t['Fatura'] >= open).reduce((s, t) => s + t['Valor'], 0);
-    const daysToClose = Math.ceil((closes - today) / 864e5);
-    return { nome: c['Nome'], final: c['Final'], limite: Number(c['Limite']) || 0, open, atual: sum(open),
-             proxima: sum(addMonths(open, 1)), closes, due, used, daysToClose,
-             delas: tx.filter(t => t['Fatura'] === open).reduce((s, t) => s + t['Parte terceiro'], 0) };
+    const fech = Number(c['Fechamento']), venc = Number(c['Vencimento']);
+    const open = calcularFatura(fech, venc, today);
+    const mine = t => cardOf(t['Cartão']) === c;
+    const compras = DB.lancamentos.filter(t => t['Tipo'] === 'Saída' && t['Forma'] === 'Crédito' && mine(t));
+    const pagos = DB.lancamentos.filter(t => isCardPayment(t) && mine(t));
+    const total = k => compras.filter(t => t['Fatura'] === k).reduce((s, t) => s + cents(t['Valor']), 0);
+    const pago = k => pagos.filter(t => t['Fatura'] === k).reduce((s, t) => s + cents(t['Valor']), 0);
+    const chaves = [...new Set(compras.map(t => t['Fatura']).concat(pagos.map(t => t['Fatura'])))].filter(Boolean);
+    const devido = chaves.reduce((s, k) => s + Math.max(0, total(k) - pago(k)), 0);
+    const datas = k => {
+      const [y, m] = k.split('-').map(Number);
+      return { fecha: new Date(y, m - 1 - (venc <= fech ? 1 : 0), fech), vence: new Date(y, m - 1, venc) };
+    };
+    const fechada = chaves.filter(k => k < open && total(k) - pago(k) > 0).sort().pop() || null;
+    const d = datas(open);
+    return { nome: c['Nome'], final: c['Final'], limite: cents(c['Limite']), open, atual: total(open), atualPaga: pago(open),
+      proxima: total(addMonths(open, 1)), closes: d.fecha, due: d.vence, used: devido,
+      daysToClose: Math.ceil((d.fecha - today) / 864e5),
+      fechada: fechada && { chave: fechada, restante: total(fechada) - pago(fechada), vence: datas(fechada).vence },
+      delas: compras.filter(t => t['Fatura'] === open).reduce((s, t) => s + cents(t['Parte terceiro']), 0) };
   });
 }
 
+/** Faturas que fazem sentido escolher num pagamento: as com saldo e a atual. */
+function invoiceOptions(cardId) {
+  const c = cardOf(cardId);
+  if (!c) return [];
+  const atual = calcularFatura(Number(c['Fechamento']), Number(c['Vencimento']), new Date());
+  const ks = new Set([addMonths(atual, -1), atual]);
+  DB.lancamentos.forEach(t => { if (cardOf(t['Cartão']) === c && t['Fatura']) ks.add(t['Fatura']); });
+  return [...ks].sort().reverse();
+}
+
 function balanceOf(name) {
-  const items = DB.lancamentos.filter(t => t['Pessoa'] === name && (t['Parte terceiro'] > 0 || t['Tipo'] === 'Entrada'));
-  const deve = items.filter(t => t['Tipo'] === 'Saída').reduce((s, t) => s + t['Parte terceiro'], 0);
-  const pagou = items.filter(t => t['Tipo'] === 'Entrada').reduce((s, t) => s + t['Valor'], 0);
-  return { saldo: deve - pagou, items };
+  const items = DB.lancamentos.filter(t => t['Pessoa'] === name && t['Status'] !== 'A classificar' &&
+    ((t['Tipo'] === 'Saída' && cents(t['Parte terceiro']) > 0) || t['Tipo'] === 'Entrada'));
+  return { saldo: saldoPessoa(DB.lancamentos, name), items };
 }
 
 function byCategory(key) {
   const map = {};
-  monthTx(key).filter(t => t['Tipo'] === 'Saída').forEach(t => {
+  monthTx(key).forEach(t => {
+    const v = contaComoMeuGasto(t);
+    if (!v) return;
     const c = t['Categoria'] || 'Sem categoria';
-    map[c] = (map[c] || 0) + myShare(t);
+    map[c] = (map[c] || 0) + v;
   });
-  const limits = Object.fromEntries(DB.categorias.map(c => [c['Categoria'], Number(c['Limite mensal']) || 0]));
-  return Object.entries(map).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).map(([c, v]) => ({ c, v, lim: limits[c] || 0 }));
+  const limits = Object.fromEntries(DB.categorias.map(c => [c['Categoria'], cents(c['Limite mensal'])]));
+  return Object.entries(map).sort((a, b) => b[1] - a[1]).map(([c, v]) => ({ c, v, lim: limits[c] || 0 }));
 }
 
 // ───────── renderização ─────────
@@ -358,17 +434,17 @@ function render() {
   document.getElementById('today').textContent = new Date().toLocaleDateString('pt-BR', { weekday: 'long', day: 'numeric', month: 'long' });
   const s = summary(month);
   const pend = DB.lancamentos.filter(isPending);
-  const [inteiro, cents] = money(s.saldo).split(',');
+  const [inteiro, cts] = moneyC(s.saldo).split(',');
 
   document.getElementById('app').innerHTML = `
     <section class="hero">
       <div class="label">Sobra de ${esc(monthName(month, { month: 'long' }))}</div>
-      <div class="big num-like ${s.saldo < 0 ? 'neg' : ''}">${esc(inteiro)}<span class="cents">,${esc(cents)}</span></div>
+      <div class="big num-like ${s.saldo < 0 ? 'neg' : ''}">${esc(inteiro)}<span class="cents">,${esc(cts)}</span></div>
       <div class="sub">${previewLine(s)}</div>
       <div class="stats">
-        <div class="stat in"><b>Entrou</b><span class="num">${money(s.entradas)}</span></div>
-        <div class="stat out"><b>Gastei</b><span class="num">${money(s.gastos)}</span></div>
-        <div class="stat"><b>Previsto no fim</b><span class="num">${money(s.previsto)}</span></div>
+        <div class="stat in"><b>Entrou</b><span class="num">${moneyC(s.entradas)}</span></div>
+        <div class="stat out"><b>Gastei</b><span class="num">${moneyC(s.gastos)}</span></div>
+        <div class="stat"><b>Previsto no fim</b><span class="num">${moneyC(s.fimPrevisto)}</span></div>
       </div>
     </section>
     <div class="grid">
@@ -389,9 +465,10 @@ function render() {
 
 function previewLine(s) {
   const parts = [];
-  if (s.salarioPrevisto) parts.push(`salário de ${money(s.salarioPrevisto)} ainda vai cair`);
-  if (s.fixosPendentes) parts.push(`${money(s.fixosPendentes)} em contas fixas a pagar`);
-  return parts.length ? 'Considerando que ' + parts.join(' e ') + '.' : 'Entradas menos a sua parte dos gastos.';
+  if (s.previsto) parts.push(`salário de ${moneyC(s.previsto)} ainda vai cair`);
+  if (s.fixosPendentes) parts.push(`${moneyC(s.fixosPendentes)} em contas fixas a pagar`);
+  const base = parts.length ? 'O previsto considera que ' + parts.join(' e ') + '.' : 'Entradas menos a sua parte dos gastos.';
+  return base + (s.pendentes ? ` <b>${moneyC(s.pendentes)}</b> aguardam revisão e ainda não entram na conta.` : '');
 }
 
 function reviewCard(pend) {
@@ -402,7 +479,7 @@ function reviewCard(pend) {
       <div class="qitem">
         <div class="qrow">
           <div><div class="what">${esc(t['Descrição'] || t['Estabelecimento'])}</div>
-          <div class="meta">${esc(t['Conta'])} · ${esc(t['Forma'])}${t['Cartão'] ? ' ' + esc(t['Cartão']) : ''} · ${dShort(t._d)} ${t._d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</div></div>
+          <div class="meta">${t['Status'] === 'A classificar' ? '<span class="pill">não conta até revisar</span> ' : ''}${esc(t['Conta'])} · ${esc(t['Forma'])}${t['Cartão'] ? ' ' + esc(cardLabel(t['Cartão'])) : ''} · ${dShort(t._d)} ${t._d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</div></div>
           <div class="num" style="color:${t['Tipo'] === 'Entrada' ? 'var(--in)' : 'var(--fg)'}">${t['Tipo'] === 'Entrada' ? '+' : ''}${money(t['Valor'])}</div>
         </div>
         <div class="chips">${quickChips(t)}</div>
@@ -421,26 +498,32 @@ function quickChips(t) {
     return `<button class="chip" data-quick="${id}" data-kind="salario">Salário</button>` +
       DB.pessoas.map(p => `<button class="chip ${norm(p['Controla saldo']) === 'SIM' ? 'her' : ''}" data-quick="${id}" data-kind="pessoa" data-p="${esc(p['Nome'])}">${esc(p['Nome'])}</button>`).join('') +
       `<button class="chip ghost" data-edit="${id}" data-nova="1">Outra pessoa…</button>` +
-      `<button class="chip" data-quick="${id}" data-kind="transf">Minha transferência</button>`;
+      `<button class="chip" data-quick="${id}" data-kind="transf">Entre minhas contas</button>`;
   }
   const main = people()[0];
   return `<button class="chip" data-quick="${id}" data-kind="meu">Meu</button>` +
     (main ? `<button class="chip her" data-quick="${id}" data-kind="dela" data-p="${esc(main)}">${esc(main)}</button><button class="chip her" data-quick="${id}" data-kind="div" data-p="${esc(main)}">Dividir</button>` : '') +
     `<button class="chip ghost" data-edit="${id}" data-nova="1">Outra pessoa…</button>` +
-    (t['Forma'] === 'Pix' ? `<button class="chip" data-quick="${id}" data-kind="transf">Minha transferência</button>` : '') +
+    (t['Forma'] === 'Pix' ? `<button class="chip" data-quick="${id}" data-kind="transf">Entre minhas contas</button><button class="chip" data-edit="${id}" data-modo="fatura">Pagamento de fatura</button>` : '') +
     `<button class="chip ghost" data-edit="${id}">Detalhar…</button>`;
 }
 
 function billsCard() {
+  const today = new Date();
   return `<section class="card"><div class="head"><h2>Faturas</h2><small>valor total do cartão</small></div>
     <div class="bills">${bills().map(b => {
       const pct = b.limite ? Math.min(100, b.used / b.limite * 100) : 0;
-      const tag = b.daysToClose <= 0 ? '<span class="pill">fechada</span>' : b.daysToClose <= 3 ? `<span class="pill">fecha em ${b.daysToClose} dia${b.daysToClose > 1 ? 's' : ''}</span>` : '<span class="pill ok">aberta</span>';
+      const tag = b.atual && b.atualPaga >= b.atual ? '<span class="pill ok">paga</span>'
+        : b.daysToClose <= 0 ? '<span class="pill">fechada</span>'
+        : b.daysToClose <= 3 ? `<span class="pill">fecha em ${b.daysToClose} dia${b.daysToClose > 1 ? 's' : ''}</span>` : '<span class="pill ok">aberta</span>';
+      const fechada = b.fechada ? `<div class="bill-closed"><span>Fatura fechada a pagar: <b class="num">${moneyC(b.fechada.restante)}</b></span>
+        <span class="pill">${b.fechada.vence < today ? 'vencida em' : 'vence'} ${dShort(b.fechada.vence)}</span></div>` : '';
       return `<div class="bill">
         <div class="row"><span class="name">${esc(b.nome)}<small>${/^\d+$/.test(b.final) ? 'final ' + esc(b.final) : ''}</small></span>${tag}</div>
-        <div class="row"><span class="num" style="font-size:22px;font-weight:500">${money(b.atual)}</span><span style="color:var(--muted);font-size:13px">próxima: <span class="num">${money(b.proxima)}</span></span></div>
-        <div class="bar" title="${pct.toFixed(0)}% do limite"><i class="${pct > 70 ? 'hot' : ''}" style="width:${pct}%"></i></div>
-        <div class="dates"><span>Fecha ${dShort(b.closes)}</span><span>Vence ${dShort(b.due)}</span><span>Limite livre <span class="num">${money(b.limite - b.used)}</span></span>${b.delas ? `<span style="color:var(--her);font-weight:700">Não é seu: ${money(b.delas)}</span>` : ''}</div>
+        ${fechada}
+        <div class="row"><span class="num" style="font-size:22px;font-weight:500">${moneyC(b.atual)}</span><span style="color:var(--muted);font-size:13px">próxima: <span class="num">${moneyC(b.proxima)}</span></span></div>
+        <div class="bar" title="${pct.toFixed(0)}% do limite em uso"><i class="${pct > 70 ? 'hot' : ''}" style="width:${pct}%"></i></div>
+        <div class="dates"><span>Fecha ${dShort(b.closes)}</span><span>Vence ${dShort(b.due)}</span><span>Limite livre <span class="num">${moneyC(b.limite - b.used)}</span></span>${b.delas ? `<span style="color:var(--her);font-weight:700">Não é seu: ${moneyC(b.delas)}</span>` : ''}</div>
       </div>`; }).join('')}</div></section>`;
 }
 
@@ -449,7 +532,7 @@ function herCard(name) {
   return `<section class="card her-card">
     <div class="head"><h2>${esc(name)}</h2><small>${items.length} lançamento${items.length === 1 ? '' : 's'}</small></div>
     <div style="font-size:13px;color:var(--muted)">${saldo >= 0 ? esc(name) + ' te deve' : 'Você deve a ' + esc(name)}</div>
-    <div class="owed num-like">${money(Math.abs(saldo))}</div>
+    <div class="owed num-like">${moneyC(Math.abs(saldo))}</div>
     <div class="actions">
       <button class="btn her" data-her="${esc(name)}">Ver detalhes</button>
       <button class="btn" data-copy="${esc(name)}">Copiar resumo</button>
@@ -460,10 +543,10 @@ function catsCard() {
   const cats = byCategory(month);
   const total = cats.reduce((s, c) => s + c.v, 0);
   const max = Math.max(...cats.map(c => Math.max(c.v, c.lim)), 1);
-  return `<section class="card"><div class="head"><h2>Para onde foi</h2><small>só a sua parte</small></div>
+  return `<section class="card"><div class="head"><h2>Para onde foi</h2><small>só a sua parte, já revisada</small></div>
     ${cats.length ? `<div class="cats">${cats.map(c => `
       <div class="cat"><span><b>${esc(c.c)}</b><span class="pct">${total ? Math.round(c.v / total * 100) : 0}%</span></span>
-      <span class="num">${money(c.v)}${c.lim ? ` <span style="color:var(--muted);font-size:12px">/ ${money(c.lim)}</span>` : ''}</span>
+      <span class="num">${moneyC(c.v)}${c.lim ? ` <span style="color:var(--muted);font-size:12px">/ ${moneyC(c.lim)}</span>` : ''}</span>
       <div class="bar"><i class="${c.lim && c.v > c.lim ? 'hot' : ''}" style="width:${c.v / max * 100}%"></i></div></div>`).join('')}</div>`
       : '<div class="empty">Nenhum gasto neste mês ainda.</div>'}
   </section>`;
@@ -515,7 +598,7 @@ function txCard() {
     return `${header}<div class="tx" data-edit="${esc(t['ID'])}" role="button" tabindex="0">
       <span class="ico ${icoCls}">${esc((t['Categoria'] || t['Tipo'] || '?').slice(0, 2))}</span>
       <span style="min-width:0"><div class="t1">${esc(t['Descrição'] || t['Estabelecimento'] || '—')}</div>
-        <div class="t2">${esc([t['Categoria'], t['Conta'] + (t['Cartão'] && /^\d+$/.test(t['Cartão']) ? ' ' + t['Cartão'] : ''), t['Status'] === 'Previsto' ? 'previsto' : ''].filter(Boolean).join(' · '))}</div></span>
+        <div class="t2">${t['Status'] === 'A classificar' ? '<span class="pill">a revisar</span> ' : ''}${esc([t['Categoria'], t['Conta'] + (t['Cartão'] ? ' · ' + cardLabel(t['Cartão']) : ''), isCardPayment(t) && t['Fatura'] ? fmtFatura(t['Fatura']) : '', t['Status'] === 'Previsto' ? 'previsto' : ''].filter(Boolean).join(' · '))}</div></span>
       <span class="amt ${kind}"><span class="num">${sign}${money(t['Valor'])}</span>${t['Parte terceiro'] ? `<small>${esc(t['Pessoa'])} ${money(t['Parte terceiro'])}</small>` : ''}</span>
     </div>`;
   }).join('');
@@ -531,11 +614,11 @@ function bindApp() {
     const el = e.target.closest('[data-quick],[data-edit],[data-act],[data-her],[data-copy],[data-payfix]');
     if (!el) return;
     if (el.dataset.quick) return quick(el.dataset.quick, el.dataset.kind, el.dataset.p);
-    if (el.dataset.edit) return openEdit(el.dataset.edit, { nova: !!el.dataset.nova });
+    if (el.dataset.edit) return openEdit(el.dataset.edit, { nova: !!el.dataset.nova, modo: el.dataset.modo });
     if (el.dataset.act === 'allmine') return save(call('api_marcarTodosMeus'), 'Gastos marcados como seus');
     if (el.dataset.her) return openHer(el.dataset.her);
     if (el.dataset.copy) return copySummary(el.dataset.copy);
-    if (el.dataset.payfix) return save(call('api_pagarFixo', el.dataset.payfix), 'Conta marcada como paga');
+    if (el.dataset.payfix) return openPayFixed(el.dataset.payfix);
   };
   app.onkeydown = e => { if (e.key === 'Enter' && e.target.dataset.edit) openEdit(e.target.dataset.edit); };
   const s = document.getElementById('search');
@@ -548,8 +631,8 @@ function quick(id, kind, person) {
   const m = {
     meu: { ...base, pessoa: '', divisao: 'Meu', parte: 0 },
     dela: { ...base, pessoa: person, divisao: 'Dela', parte: t['Valor'] },
-    div: { ...base, pessoa: person, divisao: 'Dividido', parte: Math.round(t['Valor'] * 50) / 100 },
-    transf: { tipo: 'Transferência', categoria: 'Entre contas', descricao: 'Transferência entre minhas contas', pessoa: '', parte: 0 },
+    div: { ...base, pessoa: person, divisao: 'Dividido', parte: Math.round(cents(t['Valor']) / 2) / 100 },
+    transf: { tipo: 'Transferência', categoria: CAT_ENTRE_CONTAS, descricao: 'Transferência entre minhas contas', pessoa: '', parte: 0 },
     salario: { categoria: 'Salário', descricao: 'Salário', pessoa: '' },
   }[kind];
   if (kind === 'pessoa') {
@@ -573,7 +656,7 @@ function toast(msg) {
 function copySummary(name) {
   const { saldo, items } = balanceOf(name);
   const lines = items.slice().reverse().map(t => `${dShort(t._d)}  ${t['Descrição'] || t['Estabelecimento']}  ${t['Tipo'] === 'Entrada' ? '(pagou) −' : ''}${money(t['Tipo'] === 'Entrada' ? t['Valor'] : t['Parte terceiro'])}${t['Divisão'] === 'Dividido' ? ' (metade)' : ''}`);
-  const text = `Resumo ${name}\n\n${lines.join('\n')}\n\nTotal em aberto: ${money(saldo)}`;
+  const text = `Resumo ${name}\n\n${lines.join('\n')}\n\nTotal em aberto: ${moneyC(saldo)}`;
   const done = () => toast('Resumo copiado. É só colar no WhatsApp.');
   if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
   else fallbackCopy(text, done);
@@ -657,48 +740,153 @@ function bindWho(el, getValor, opts = {}) {
   };
 }
 
+/** O que o lançamento é, na linguagem de quem revisa; cada opção vira Tipo + Categoria no backend. */
+const MODOS = {
+  gasto: { rotulo: 'Gasto', tipo: 'Saída' },
+  entrada: { rotulo: 'Entrada', tipo: 'Entrada' },
+  transf: { rotulo: 'Entre minhas contas', tipo: 'Transferência', categoria: CAT_ENTRE_CONTAS },
+  fatura: { rotulo: 'Pagamento de fatura', tipo: 'Transferência', categoria: CAT_FATURA },
+};
+function modoDe(t) {
+  if (t['Tipo'] === 'Transferência') return t['Categoria'] === CAT_FATURA ? 'fatura' : 'transf';
+  return t['Tipo'] === 'Entrada' ? 'entrada' : 'gasto';
+}
+const toLocalInput = d => new Date(d - d.getTimezoneOffset() * 6e4).toISOString().slice(0, 16);
+const fmtFatura = k => { const [y, m] = k.split('-').map(Number); return 'vence em ' + new Date(y, m - 1, 1).toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' }); };
+const cardValue = c => String(c['Final'] || c['Nome']);
+const cardSelect = (idSel, atual) => `<select id="${idSel}"><option value="">Escolha o cartão</option>${DB.cartoes.map(c =>
+  `<option value="${esc(cardValue(c))}" ${cardOf(atual) === c ? 'selected' : ''}>${esc(c['Nome'])}</option>`).join('')}</select>`;
+
 function openEdit(id, opts = {}) {
   const t = DB.lancamentos.find(x => x['ID'] === id);
   if (!t) return;
-  const isOut = t['Tipo'] === 'Saída';
+  let modo = opts.modo || modoDe(t);
+  const previsto = t['Status'] === 'Previsto';
+  const contas = [...new Set((DB.contas || []).concat(t['Conta'] ? [t['Conta']] : []))];
   const el = sheet(`
     <div><div class="orig">${esc(t['Conta'])} · ${esc(t['Forma'])} · ${t._d.toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' })}</div>
     <div class="amount num-like">${money(t['Valor'])}</div>
     <div class="orig">${esc(t['Estabelecimento'])}</div></div>
-    ${t['Status'] === 'Previsto' ? `<label class="field"><span>Valor que caiu</span><input id="fValor" type="number" step="0.01" inputmode="decimal" value="${t['Valor'] || ''}"></label>` : ''}
+    ${previsto ? `<label class="field"><span>Valor que caiu</span><input id="fValorPrev" type="number" step="0.01" min="0.01" inputmode="decimal" value="${t['Valor'] || ''}"></label>` : `
+    <div class="field"><span>O que é</span><div class="chips" id="modo">${Object.entries(MODOS).map(([k, v]) =>
+      `<button type="button" class="chip ${k === modo ? 'on' : ''}" data-modo="${k}">${v.rotulo}</button>`).join('')}</div></div>`}
     <label class="field"><span>Descrição</span><input id="fDesc" value="${esc(t['Descrição'])}" placeholder="ex.: salgado, mercado, loja de roupa"></label>
-    ${t['Tipo'] !== 'Transferência' ? whoBlock(t, t['Tipo'] === 'Entrada') : ''}
-    <div class="row2">
-      <label class="field"><span>Categoria</span><select id="fCat"><option value="">—</option>${catOptions(t['Tipo'], t['Categoria'])}</select></label>
-      <label class="field"><span>Tipo</span><select id="fTipo">${['Saída', 'Entrada', 'Transferência'].map(x => `<option ${x === t['Tipo'] ? 'selected' : ''}>${x}</option>`).join('')}</select></label>
-    </div>
-    ${t['Estabelecimento'] && t['Origem'] === 'Notificação' ? `<label class="check"><input type="checkbox" id="fLembrar"> Lembrar descrição e categoria para "${esc(t['Estabelecimento'])}"</label>` : ''}
+    <div id="modoArea" style="display:grid;gap:14px"></div>
+    <details class="more"><summary>Mais detalhes</summary><div class="more-body">
+      <div class="row2">
+        <label class="field"><span>Valor total</span><input id="fValor" type="number" step="0.01" min="0.01" inputmode="decimal" value="${t['Valor']}"></label>
+        <label class="field"><span>Data e hora</span><input id="fData" type="datetime-local" value="${toLocalInput(t._d)}"></label>
+      </div>
+      <div class="row2">
+        <label class="field"><span>Conta</span><select id="fConta">${contas.map(c => `<option ${c === t['Conta'] ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></label>
+        <label class="field"><span>Forma de pagamento</span><select id="fForma">${(DB.formas || []).map(f => `<option ${f === t['Forma'] ? 'selected' : ''}>${esc(f)}</option>`).join('')}</select></label>
+      </div>
+      <label class="field" id="cardBox"><span>Cartão</span>${cardSelect('fCartao', t['Forma'] === 'Crédito' ? t['Cartão'] : '')}</label>
+      <label class="field"><span>Estabelecimento (como veio do banco)</span><input id="fEstab" value="${esc(t['Estabelecimento'])}"></label>
+    </div></details>
     <div class="foot">
       <button class="btn danger" id="del">Excluir</button>
       <div class="right"><button class="btn" id="cancel">Cancelar</button><button class="btn primary" id="ok">Salvar</button></div>
     </div>
-    <div id="confirmDel" hidden style="background:var(--surface-2);border-radius:10px;padding:10px 12px;display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap">
+    <div id="confirmDel" class="confirm" hidden>
       <span>Excluir este lançamento de vez?</span><span style="display:flex;gap:8px"><button class="btn" id="noDel">Manter</button><button class="btn" style="color:var(--out)" id="yesDel">Excluir</button></span>
     </div>`);
+  const $ = s => el.querySelector(s);
+  const valorAtual = () => Number(($('#fValorPrev') || $('#fValor')).value) || t['Valor'];
+  let readWho = null;
 
-  const readWho = t['Tipo'] !== 'Transferência' ? bindWho(el, () => Number((el.querySelector('#fValor') || {}).value) || t['Valor'], opts) : null;
-  el.querySelector('#cancel').onclick = closeSheet;
-  el.querySelector('#del').onclick = () => { el.querySelector('#confirmDel').hidden = false; };
-  el.querySelector('#noDel').onclick = () => { el.querySelector('#confirmDel').hidden = true; };
-  el.querySelector('#yesDel').onclick = () => save(call('api_excluir', id), 'Lançamento excluído');
-  el.querySelector('#ok').onclick = () => {
-    const m = { descricao: el.querySelector('#fDesc').value.trim(), categoria: el.querySelector('#fCat').value, tipo: el.querySelector('#fTipo').value };
-    if (readWho) {
-      const w = readWho(); if (!w) return toast('Escreva o nome da pessoa.');
-      Object.assign(m, w);
-      if (t['Tipo'] === 'Entrada' && w.pessoa && !m.categoria) {
-        const p = DB.pessoas.find(x => x['Nome'] === w.pessoa);
-        m.categoria = p ? p['Categoria de entrada'] : (w.novaPessoa && w.novaPessoa.controla ? 'Acerto' : 'Outras entradas');
-      }
+  function drawModo() {
+    const area = $('#modoArea');
+    const lembrar = t['Estabelecimento'] && t['Origem'] !== 'Manual' && t['Forma'] !== 'Pix'
+      ? `<label class="check"><input type="checkbox" id="fLembrar"> Lembrar descrição e categoria para "${esc(t['Estabelecimento'])}"</label>` : '';
+    readWho = null;
+    if (previsto || modo === 'gasto' || modo === 'entrada') {
+      const entrada = previsto || modo === 'entrada';
+      area.innerHTML = (previsto ? '' : whoBlock(t, entrada)) + `
+        <label class="field"><span>Categoria</span><select id="fCat"><option value="">—</option>${catOptions(entrada ? 'Entrada' : 'Saída', previsto ? 'Salário' : t['Categoria'])}</select></label>` + lembrar;
+      if (!previsto) readWho = bindWho(area, valorAtual, opts);
+    } else if (modo === 'transf') {
+      area.innerHTML = `<p class="hint">Não conta como gasto nem como entrada. Se a outra ponta já estiver aqui (mesmo valor, outra conta, até 30 minutos de diferença), as duas ficam ligadas.</p>`;
+    } else {
+      const atual = cardOf(t['Cartão']) ? t['Cartão'] : '';
+      area.innerHTML = `<div class="row2">
+          <label class="field"><span>Qual cartão</span>${cardSelect('fFatCartao', atual)}</label>
+          <label class="field"><span>Qual fatura</span><select id="fFatura"></select></label>
+        </div>
+        <p class="hint">Não conta como gasto: as compras desse cartão já foram contadas quando aconteceram.</p>`;
+      const fillInvoices = () => {
+        const opts2 = invoiceOptions($('#fFatCartao').value);
+        $('#fFatura').innerHTML = opts2.length ? opts2.map(k => `<option value="${k}" ${k === t['Fatura'] ? 'selected' : ''}>${fmtFatura(k)}</option>`).join('') : '<option value="">Escolha o cartão primeiro</option>';
+      };
+      $('#fFatCartao').onchange = fillInvoices;
+      fillInvoices();
     }
-    const fv = el.querySelector('#fValor'); if (fv) { m.valor = Number(fv.value) || 0; m.status = 'OK'; if (!m.categoria) m.categoria = 'Salário'; }
-    const fl = el.querySelector('#fLembrar'); if (fl && fl.checked) m.lembrar = true;
+  }
+  drawModo();
+  el.querySelectorAll('[data-modo]').forEach(b => b.onclick = () => {
+    el.querySelectorAll('[data-modo]').forEach(x => x.classList.remove('on')); b.classList.add('on');
+    modo = b.dataset.modo; opts = {}; drawModo();
+  });
+  const syncCard = () => { $('#cardBox').hidden = $('#fForma').value !== 'Crédito'; };
+  $('#fForma').onchange = syncCard; syncCard();
+
+  $('#cancel').onclick = closeSheet;
+  $('#del').onclick = () => { $('#confirmDel').hidden = false; };
+  $('#noDel').onclick = () => { $('#confirmDel').hidden = true; };
+  $('#yesDel').onclick = () => save(call('api_excluir', id), 'Lançamento excluído');
+  $('#ok').onclick = () => {
+    const m = { status: 'OK', descricao: $('#fDesc').value.trim() };
+    if (previsto) {
+      const v = Number($('#fValorPrev').value);
+      if (!(v > 0)) return toast('Informe o valor que caiu.');
+      Object.assign(m, { valor: v, categoria: $('#fCat').value || 'Salário', descricao: m.descricao || 'Salário' });
+    } else {
+      m.tipo = MODOS[modo].tipo;
+      if (modo === 'gasto' || modo === 'entrada') {
+        m.categoria = $('#fCat').value;
+        const w = readWho(); if (!w) return toast('Escreva o nome da pessoa.');
+        Object.assign(m, w);
+        if (modo === 'entrada' && w.pessoa && !m.categoria) {
+          const p = DB.pessoas.find(x => x['Nome'] === w.pessoa);
+          m.categoria = p ? p['Categoria de entrada'] : (w.novaPessoa && w.novaPessoa.controla ? 'Acerto' : 'Outras entradas');
+        }
+      } else if (modo === 'transf') {
+        Object.assign(m, { categoria: CAT_ENTRE_CONTAS, descricao: m.descricao || 'Transferência entre minhas contas' });
+      } else {
+        const cartao = $('#fFatCartao').value, fatura = $('#fFatura').value;
+        if (!cartao || !fatura) return toast('Escolha o cartão e a fatura.');
+        Object.assign(m, { categoria: CAT_FATURA, cartao, fatura, descricao: m.descricao || 'Fatura ' + cardLabel(cartao) });
+      }
+      const v = Number($('#fValor').value);
+      if (cents(v) !== cents(t['Valor'])) { if (!(v > 0)) return toast('O valor precisa ser maior que zero.'); m.valor = v; }
+    }
+    const novaData = new Date($('#fData').value);
+    if (!isNaN(novaData) && Math.abs(novaData - t._d) >= 6e4) m.data = novaData.toISOString();
+    if ($('#fConta').value !== t['Conta']) m.conta = $('#fConta').value;
+    if ($('#fForma').value !== t['Forma']) m.forma = $('#fForma').value;
+    if ($('#fEstab').value.trim() !== String(t['Estabelecimento'])) m.estabelecimento = $('#fEstab').value.trim();
+    if (modo === 'gasto' && (m.forma || t['Forma']) === 'Crédito') {
+      const c = $('#fCartao').value;
+      if (!c) return toast('Escolha o cartão da compra.');
+      if (cardOf(c) !== cardOf(t['Cartão'])) m.cartao = c;
+    }
+    const fl = $('#fLembrar'); if (fl && fl.checked) m.lembrar = true;
     save(call('api_atualizar', id, m), 'Salvo');
+  };
+}
+
+function openPayFixed(nome) {
+  const f = DB.fixos.find(x => x['Nome'] === nome);
+  if (!f) return;
+  const el = sheet(`<h3>${esc(nome)}</h3>
+    <p class="hint">Vai ser lançado como pago hoje, por <b>${esc(f['Forma'] || 'forma não definida')}</b>. A forma e o cartão vêm da aba Fixos da planilha.</p>
+    <label class="field"><span>Valor pago</span><input id="pfValor" type="number" step="0.01" min="0.01" inputmode="decimal" value="${cents(f['Valor']) / 100}"></label>
+    <div class="foot"><span></span><div class="right"><button class="btn" id="cancel">Cancelar</button><button class="btn primary" id="ok">Marcar como pago</button></div></div>`);
+  el.querySelector('#cancel').onclick = closeSheet;
+  el.querySelector('#ok').onclick = () => {
+    const v = Number(el.querySelector('#pfValor').value);
+    if (!(v > 0)) return toast('Informe o valor pago.');
+    save(call('api_pagarFixo', nome, v, {}), 'Conta marcada como paga');
   };
 }
 
@@ -715,13 +903,15 @@ function openNew() {
     <div class="row2">
       <label class="field"><span>Categoria</span><select id="nCat"><option value="">—</option>${catOptions('Saída', '')}</select></label>
       <label class="field"><span>Como pagou</span><select id="nForma">
-        <option value="Dinheiro|Dinheiro|">Dinheiro</option><option value="Pix|Santander|">Pix Santander</option><option value="Pix|99Pay|">Pix 99Pay</option>
-        ${DB.cartoes.map(c => `<option value="Crédito|${esc(c['Conta'])}|${esc(c['Final'])}">Crédito ${esc(c['Nome'])}</option>`).join('')}
+        <option value="Dinheiro|Dinheiro|">Dinheiro</option>
+        ${(DB.contas || []).filter(c => c !== 'Dinheiro').map(c => `<option value="Pix|${esc(c)}|">Pix ${esc(c)}</option><option value="Débito|${esc(c)}|">Débito ${esc(c)}</option>`).join('')}
+        ${DB.cartoes.map(c => `<option value="Crédito|${esc(c['Conta'])}|${esc(cardValue(c))}">Crédito ${esc(c['Nome'])}</option>`).join('')}
       </select></label>
     </div>
     <div id="whoArea" style="display:grid;gap:14px"></div>
     <div class="foot"><span></span><div class="right"><button class="btn" id="cancel">Cancelar</button><button class="btn primary" id="ok">Lançar</button></div></div>`);
   let tipo = 'Saída', readWho;
+  const idCliente = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   const getValor = () => Number(el.querySelector('#nValor').value) || 0;
   const drawWho = () => { el.querySelector('#whoArea').innerHTML = whoBlock({}, tipo === 'Entrada'); readWho = bindWho(el.querySelector('#whoArea'), getValor); };
   drawWho();
@@ -733,10 +923,10 @@ function openNew() {
   el.querySelector('#cancel').onclick = closeSheet;
   el.querySelector('#ok').onclick = () => {
     const valor = Number(el.querySelector('#nValor').value);
-    if (!valor) { el.querySelector('#nValor').focus(); return toast('Informe o valor.'); }
+    if (!(valor > 0)) { el.querySelector('#nValor').focus(); return toast('Informe um valor maior que zero.'); }
     const [forma, conta, cartao] = el.querySelector('#nForma').value.split('|');
     const n = { tipo, valor, data: new Date(el.querySelector('#nData').value).toISOString(), descricao: el.querySelector('#nDesc').value.trim(),
-      categoria: el.querySelector('#nCat').value, forma, conta, cartao, divisao: 'Meu', pessoa: '', parte: 0 };
+      categoria: el.querySelector('#nCat').value, forma, conta, cartao, divisao: 'Meu', pessoa: '', parte: 0, idCliente };
     const w = readWho(); if (!w) return toast('Escreva o nome da pessoa.');
     Object.assign(n, w);
     if (tipo === 'Entrada' && w.pessoa && !n.categoria) {
@@ -750,7 +940,7 @@ function openNew() {
 function openHer(name) {
   const { saldo, items } = balanceOf(name);
   sheet(`<h3>${esc(name)}</h3>
-    <div><div class="orig">${saldo >= 0 ? 'Em aberto' : 'Você deve a ela'}</div><div class="amount num-like" style="color:var(--her)">${money(Math.abs(saldo))}</div></div>
+    <div><div class="orig">${saldo >= 0 ? 'Em aberto' : 'Você deve a ' + esc(name)}</div><div class="amount num-like" style="color:var(--her)">${moneyC(Math.abs(saldo))}</div></div>
     <div>${items.length ? items.map(t => `<div class="tx" data-goto="${esc(t['ID'])}">
       <span class="ico ${t['Tipo'] === 'Entrada' ? 'in' : 'her'}">${t['Tipo'] === 'Entrada' ? 'Pg' : t['Divisão'] === 'Dividido' ? '½' : esc(name.slice(0, 1))}</span>
       <span style="min-width:0"><div class="t1">${esc(t['Descrição'] || t['Estabelecimento'])}</div><div class="t2">${t._d.toLocaleDateString('pt-BR')} · ${t['Tipo'] === 'Entrada' ? 'pagamento' : t['Divisão'] === 'Dividido' ? 'metade de ' + money(t['Valor']) : 'dela'}</div></span>
@@ -766,9 +956,13 @@ function openHer(name) {
 document.getElementById('prev').onclick = () => { month = addMonths(month, -1); render(); };
 document.getElementById('next').onclick = () => { month = addMonths(month, 1); render(); };
 document.getElementById('fab').onclick = () => DB && openNew();
+document.getElementById('logout').onclick = () => {
+  call('api_sair').catch(() => {}).finally(() => { saveSession(''); DB = null; showLock(true); toast('Você saiu deste aparelho.'); });
+};
 
 function showLock(temSenha) {
   document.getElementById('fab').hidden = true;
+  document.getElementById('logout').hidden = true;
   document.querySelector('.month').hidden = true;
   const app = document.getElementById('app');
   app.innerHTML = temSenha ? `
@@ -812,6 +1006,7 @@ function start() {
 
 function loadAll() {
   document.getElementById('fab').hidden = false;
+  document.getElementById('logout').hidden = NO_GOOGLE;
   document.querySelector('.month').hidden = false;
   document.getElementById('app').innerHTML = '<div class="loading">Carregando seus lançamentos…</div>';
   call('api_dados').then(json => {
@@ -853,6 +1048,7 @@ const Mock = (() => {
     { 'Data': at(0, 1, 18), 'Valor': 23.07, 'Descrição': '', 'Estabelecimento': 'REDEMARKET CAIS', 'Categoria': 'Mercado', 'Status': 'Novo' },
     { 'Data': at(0, 1, 19), 'Valor': 18.5, 'Descrição': '', 'Estabelecimento': 'MC PEREIRA CESTAS ALI', 'Categoria': '', 'Status': 'Novo' },
     { 'Data': at(0, 1, 20), 'Tipo': 'Entrada', 'Valor': 100, 'Estabelecimento': 'Pix recebido', 'Forma': 'Pix', 'Cartão': '', 'Status': 'A classificar' },
+    { 'Data': at(0, 1, 21), 'Valor': 580.46, 'Estabelecimento': 'Pix enviado', 'Forma': 'Pix', 'Cartão': '', 'Status': 'A classificar' },
   ];
   cur.forEach(o => add(Object.assign(o, { 'Fatura': o['Forma'] === 'Pix' || o['Tipo'] === 'Entrada' ? '' : fat(o['Data']) })));
   add({ 'Data': at(0, 28, 8), 'Tipo': 'Entrada', 'Valor': 1500, 'Descrição': 'Salário', 'Categoria': 'Salário', 'Conta': 'Bradesco', 'Forma': 'Depósito', 'Cartão': '', 'Status': 'Previsto' });
@@ -867,15 +1063,19 @@ const Mock = (() => {
             { 'Nome': 'Academia', 'Valor': 89.9, 'Dia': 5, 'Forma': 'Pix', 'Palavra-chave': 'ACADEMIA|SMART FIT' }],
     categorias: ['Alimentação', 'Mercado', 'Transporte', 'Moradia', 'Contas', 'Assinaturas', 'Saúde', 'Lazer', 'Compras', 'Educação', 'Presentes', 'Outros']
       .map(c => ({ 'Categoria': c, 'Tipo': 'Saída', 'Limite mensal': c === 'Alimentação' ? 500 : '' }))
-      .concat(['Salário', 'Família', 'Acerto', 'Outras entradas'].map(c => ({ 'Categoria': c, 'Tipo': 'Entrada', 'Limite mensal': '' }))),
+      .concat(['Salário', 'Família', 'Acerto', 'Outras entradas'].map(c => ({ 'Categoria': c, 'Tipo': 'Entrada', 'Limite mensal': '' })))
+      .concat(['Entre contas', 'Pagamento de fatura'].map(c => ({ 'Categoria': c, 'Tipo': 'Transferência', 'Limite mensal': '' }))),
   };
-  const dump = () => JSON.stringify(Object.assign({ lancamentos: L, salario: [] }, base));
+  const dump = () => JSON.stringify(Object.assign({ lancamentos: L, salario: [], contas: ['Santander', 'Bradesco', 'Mercado Pago', '99Pay', 'PicPay', 'Dinheiro'],
+    formas: ['Crédito', 'Débito', 'Pix', 'Dinheiro', 'Transferência', 'Boleto', 'Depósito'] }, base));
   const find = i => L.find(t => t['ID'] === i);
   const novaPessoa = p => { if (p && p.nome && !base.pessoas.some(x => x['Nome'] === p.nome)) base.pessoas.push({ 'Nome': p.nome, 'Controla saldo': p.controla ? 'Sim' : 'Não', 'Categoria de entrada': p.controla ? 'Acerto' : 'Outras entradas', 'Conta como renda': p.controla ? 'Não' : 'Sim' }); };
   return {
     api_dados: dump,
     api_atualizar(i, m) {
-      const t = find(i); const map = { descricao: 'Descrição', categoria: 'Categoria', tipo: 'Tipo', valor: 'Valor', pessoa: 'Pessoa', divisao: 'Divisão', parte: 'Parte terceiro' };
+      const t = find(i); const map = { descricao: 'Descrição', categoria: 'Categoria', tipo: 'Tipo', valor: 'Valor', pessoa: 'Pessoa', divisao: 'Divisão', parte: 'Parte terceiro',
+        estabelecimento: 'Estabelecimento', conta: 'Conta', forma: 'Forma', cartao: 'Cartão', fatura: 'Fatura', data: 'Data' };
+      if (m.divisao === 'Meu') { m.pessoa = ''; m.parte = 0; } if (m.divisao === 'Dela') m.parte = m.valor || t['Valor'];
       Object.keys(map).forEach(k => { if (k in m) t[map[k]] = m[k]; }); t['Status'] = m.status || 'OK'; novaPessoa(m.novaPessoa); return dump();
     },
     api_marcarTodosMeus() { L.filter(t => t['Status'] === 'Novo' && t['Tipo'] === 'Saída').forEach(t => t['Status'] = 'OK'); return dump(); },
@@ -885,8 +1085,10 @@ const Mock = (() => {
             'Cartão': n.cartao, 'Fatura': n.forma === 'Crédito' ? fat(n.data) : '', 'Pessoa': n.pessoa, 'Divisão': n.divisao, 'Parte terceiro': n.parte });
       return dump();
     },
+    api_sair() { return true; },
     api_excluir(i) { L.splice(L.indexOf(find(i)), 1); return dump(); },
-    api_pagarFixo(nome) { const f = base.fixos.find(x => x['Nome'] === nome); add({ 'Data': new Date().toISOString(), 'Valor': f['Valor'], 'Descrição': nome, 'Estabelecimento': nome, 'Categoria': 'Contas', 'Forma': 'Pix', 'Cartão': '' }); return dump(); },
+    api_pagarFixo(nome, v) { const f0 = base.fixos.find(x => x['Nome'] === nome); if (v) f0['Valor'] = v; return this.__pagar(nome); },
+    __pagar(nome) { const f = base.fixos.find(x => x['Nome'] === nome); add({ 'Data': new Date().toISOString(), 'Valor': f['Valor'], 'Descrição': nome, 'Estabelecimento': nome, 'Categoria': 'Contas', 'Forma': 'Pix', 'Cartão': '' }); return dump(); },
   };
 })();
 
