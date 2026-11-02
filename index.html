@@ -341,7 +341,11 @@ let month = ym(new Date());
 
 function load(json) {
   DB = typeof json === 'string' ? JSON.parse(json) : json;
-  DB.lancamentos.forEach(t => { t._d = new Date(t['Data']); t['Valor'] = Number(t['Valor']) || 0; t['Parte terceiro'] = Number(t['Parte terceiro']) || 0; });
+  DB.lancamentos.forEach(t => {
+    t._d = new Date(t['Data']); t['Valor'] = Number(t['Valor']) || 0; t['Parte terceiro'] = Number(t['Parte terceiro']) || 0;
+    // fatura que a planilha transformou em data volta a ser "aaaa-mm"
+    if (/^\d{4}-\d{2}-\d{2}T/.test(String(t['Fatura']))) t['Fatura'] = ym(new Date(t['Fatura']));
+  });
   DB.lancamentos.sort((a, b) => b._d - a._d);
   render();
   if (IS_APP) {
