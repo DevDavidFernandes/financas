@@ -413,7 +413,10 @@ const people = () => DB.pessoas.filter(p => norm(p['Controla saldo']) === 'SIM')
 const isPending = t => t['Status'] === 'Novo' || t['Status'] === 'A classificar';
 const isCardPayment = t => t['Tipo'] === 'Transferência' && t['Categoria'] === CAT_FATURA;
 function monthTx(key) { return DB.lancamentos.filter(t => ym(t._d) === key); }
-function cardOf(id) { const a = norm(id); return a ? DB.cartoes.find(c => norm(c['Final']) === a || norm(c['Nome']) === a) : null; }
+/** Um cartão pode ter vários finais separados por "|" (virtual e físico na mesma fatura). */
+const finaisDe = c => String(c['Final'] || '').split(/[|,/]/).map(norm).filter(Boolean);
+function cardOf(id) { const a = norm(id); return a ? DB.cartoes.find(c => norm(c['Final']) === a || norm(c['Nome']) === a || finaisDe(c).includes(a)) : null; }
+const finalLabel = f => { const l = String(f || '').split(/[|,/]/).map(s => s.trim()).filter(s => /^\d+$/.test(s)); return l.length ? 'final ' + l.join(' / ') : ''; };
 const cardLabel = id => { const c = cardOf(id); return c ? c['Nome'] : String(id || ''); };
 
 function summary(key) {
@@ -636,7 +639,7 @@ function billsCard() {
       const fechada = b.fechada ? `<div class="bill-closed"><span>Fatura fechada a pagar: <b class="num">${moneyC(b.fechada.restante)}</b></span>
         <span class="pill">${b.fechada.vence < today ? 'vencida em' : 'vence'} ${dShort(b.fechada.vence)}</span></div>` : '';
       return `<div class="bill">
-        <div class="row"><span class="name">${esc(b.nome)}<small>${/^\d+$/.test(b.final) ? 'final ' + esc(b.final) : ''}</small></span>${tag}</div>
+        <div class="row"><span class="name">${esc(b.nome)}<small>${esc(finalLabel(b.final))}</small></span>${tag}</div>
         ${fechada}
         <div class="row"><span class="num" style="font-size:22px;font-weight:500">${moneyC(b.atual)}</span><span style="color:var(--muted);font-size:13px">próxima: <span class="num">${moneyC(b.proxima)}</span></span></div>
         <div class="bar" title="${pct.toFixed(0)}% do limite em uso"><i class="${pct > 70 ? 'hot' : ''}" style="width:${pct}%"></i></div>
@@ -1016,7 +1019,7 @@ function renderCartoes() {
       return restantes.length ? { nome: String(g[0]['Descrição']).replace(/\s*\(\d+\/\d+\)$/, ''), restantes: restantes.length, total: g.length, valor: restantes.reduce((s, t) => s + cents(t['Valor']), 0) } : null;
     }).filter(Boolean);
     return `<section class="card">
-      <div class="head"><h2>${esc(b.nome)}</h2><small>${/^\d+$/.test(b.final) ? 'final ' + esc(b.final) + ' · ' : ''}fecha dia ${esc(c['Fechamento'])} · vence dia ${esc(c['Vencimento'])}</small></div>
+      <div class="head"><h2>${esc(b.nome)}</h2><small>${finalLabel(b.final) ? esc(finalLabel(b.final)) + ' · ' : ''}fecha dia ${esc(c['Fechamento'])} · vence dia ${esc(c['Vencimento'])}</small></div>
       <div class="kv">
         <div><span>Limite</span><b class="num">${moneyC(b.limite)}</b></div>
         <div><span>Em uso</span><b class="num">${moneyC(b.used)}</b></div>
