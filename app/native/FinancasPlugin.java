@@ -50,6 +50,31 @@ public class FinancasPlugin extends Plugin {
         }).start();
     }
 
+    /** Reenvia a fila e varre a barra de notificações (o que o HyperOS possa ter deixado passar). */
+    @PluginMethod
+    public void reenviar(PluginCall call) {
+        new Thread(() -> {
+            NotificacoesService s = NotificacoesService.instancia;
+            int entregues = Rede.reenviarPendentes(getContext());
+            if (s != null) s.recuperar();
+            JSObject o = new JSObject();
+            o.put("entregues", entregues);
+            o.put("leitorAtivo", s != null);
+            o.put("pendentes", Rede.quantosPendentes(getContext()));
+            call.resolve(o);
+        }).start();
+    }
+
+    /** Últimos envios ao receptor, para conferir no app o que chegou e o que falhou. */
+    @PluginMethod
+    public void historico(PluginCall call) {
+        JSObject o = new JSObject();
+        o.put("itens", Rede.historico(getContext()).toString());
+        o.put("pendentes", Rede.quantosPendentes(getContext()));
+        o.put("leitorAtivo", NotificacoesService.instancia != null);
+        call.resolve(o);
+    }
+
     private JSObject estadoAtual() {
         SharedPreferences p = Rede.prefs(getContext());
         JSObject o = new JSObject();
