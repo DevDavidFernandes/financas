@@ -349,6 +349,8 @@ function load(json) {
   DB.lancamentos.sort((a, b) => b._d - a._d);
   render();
   if (IS_APP) {
+    // ao abrir o app, recupera o que o celular não conseguiu enviar (sem internet, app congelado)
+    if (!load.recuperou) { load.recuperou = true; nativo('reenviar').then(r => { if (r && r.entregues) toast(r.entregues + ' notificação(ões) atrasada(s) enviada(s).'); }); }
     nativo('configurar', { pessoa: people()[0] || '', url: API_URL, sessao: SESSAO }).then(st => {
       if (st && (!st.token || !st.leitura) && !load.avisou) { load.avisou = true; toast('Termine de configurar o app na aba Contas.'); }
     });
@@ -1068,7 +1070,23 @@ function preencherAppCard() {
       <div class="fixed">${item(st.token, 'Token do receptor salvo')}${item(st.leitura, 'Leitura de notificações liberada')}${item(st.avisos, 'Notificação "De quem foi?" permitida')}${item(st.sessao, 'Sessão do painel guardada para os botões')}</div>
       <label class="field" style="margin-top:10px"><span>Token (aba Config da planilha)</span><input id="apToken" autocomplete="off" placeholder="${st.token ? 'já salvo — cole outro para trocar' : 'cole aqui'}"></label>
       <div class="row-actions"><button class="btn" id="apSalvar">Salvar token</button><button class="btn" id="apLeitura">Liberar leitura</button><button class="btn primary" id="apTestar">Testar conexão</button></div>
-      <p class="hint">Depois que o teste der certo e uma compra real aparecer em "A revisar", desligue a macro do MacroDroid para não ficar com dois leitores.</p>`;
+      <p class="hint">Depois que o teste der certo e uma compra real aparecer em "A revisar", desligue a macro do MacroDroid para não ficar com dois leitores.</p>
+      <h3 class="sub-h">Últimos envios <button class="link" id="apReenviar">Reenviar agora</button></h3>
+      <div id="apHist" class="fixed"><div class="empty">Carregando…</div></div>`;
+    el.querySelector('#apReenviar').onclick = () => nativo('reenviar').then(r => {
+      toast(!r ? 'Indisponível nesta versão do app.' : (r.entregues ? r.entregues + ' enviada(s). ' : 'Nada atrasado. ') + (r.leitorAtivo ? '' : 'O leitor está parado: confira a permissão.'));
+      preencherAppCard();
+    });
+    nativo('historico').then(h => {
+      const box = el.querySelector('#apHist');
+      if (!h) { box.innerHTML = '<div class="empty">Atualize o app para ver o histórico.</div>'; return; }
+      let itens = [];
+      try { itens = JSON.parse(h.itens || '[]').reverse().slice(0, 10); } catch (e) { itens = []; }
+      const rotulo = r => /ok:/.test(r) ? ['paid', 'registrado'] : /duplicado/.test(r) ? ['paid', 'já tinha'] : /não reconhecido|ignorado/.test(r) ? ['', 'sem valor de compra'] : ['late', r];
+      box.innerHTML = (h.pendentes ? `<div class="bill-closed">${h.pendentes} aguardando internet para reenviar</div>` : '') +
+        (h.leitorAtivo ? '' : '<div class="bill-closed">O leitor de notificações não está ativo agora.</div>') +
+        (itens.map(i => { const [cls, txt] = rotulo(String(i.resultado || '')); return `<div class="fx ${cls}"><span class="dot">${cls === 'paid' ? '✓' : ''}</span><span class="n"><b>${esc(String(i.texto).slice(0, 70))}</b><small>${new Date(i.quando).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' })} · ${esc(txt)}</small></span></div>`; }).join('') || '<div class="empty">Nenhum envio ainda.</div>');
+    });
     el.querySelector('#apSalvar').onclick = () => {
       const t = el.querySelector('#apToken').value.trim();
       if (!t) return toast('Cole o token da aba Config.');
